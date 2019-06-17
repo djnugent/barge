@@ -1,0 +1,258 @@
+#!/usr/bin/env python
+# PYTHON_ARGCOMPLETE_OK
+
+'''
+    ____  ___    ____  ____________
+   / __ )/   |  / __ \/ ____/ ____/
+  / __  / /| | / /_/ / / __/ __/
+ / /_/ / ___ |/ _, _/ /_/ / /___
+/_____/_/  |_/_/ |_|\____/_____/
+
+
+Author: Daniel Nugent
+2019
+Barge is a tool for easily managing docker containers on my dev machine.
+It mounts to the home directory and can be called from anywhere
+It uses the docker API and autocomplete for ease of use
+It allows you to use Nvidia GPU and does X forwarding
+Still working on proper device and network interface forwarding
+My work is geared towards robotics so device access from docker is important
+'''
+
+import os
+import errno
+import sys
+import select
+import termios
+import tty
+import pty
+from subprocess import Popen
+import docker
+import argcomplete, argparse
+from argcomplete import warn
+import glob
+import json
+
+client = docker.from_env()
+barge_dir = os.environ['BARGE_DIR']
+file_ext = ".dkr"
+
+# Drop into a new session in an existing container
+# TODO this may suffer a performance hit with high frequency printing
+def _shell(name):
+    # Verify args
+    if len(name) == 0:
+        raise ValueError("Image name(arg1) cannot be blank")
+
+    # Verify container is there
+    try:
+        client.containers.get(name)
+    except docker.errors.NotFound:
+        print('Container named "{}" does not exist'.format(name))
+
+    command = 'docker exec -it {} /bin/bash'.format(name).split()
+
+    # save original tty setting then set it to raw mode
+    old_tty = termios.tcgetattr(sys.stdin)
+    tty.setraw(sys.stdin.fileno())
+
+    # open pseudo-terminal to interact with subprocess
+    master_fd, slave_fd = pty.openpty()
+
+    # use os.setsid() make it run in a new process group, or bash job control will not be enabled
+    p = Popen(command,
+              preexec_fn=os.setsid,
+              stdin=slave_fd,
+              stdout=slave_fd,
+              stderr=slave_fd,
+              universal_newlines=True)
+
+    while p.poll() is None:
+        r, w, e = select.select([sys.stdin, master_fd], [], [])
+        if sys.stdin in r:
+            d = os.read(sys.stdin.fileno(), 10240)
+            os.write(master_fd, d)
+        elif master_fd in r:
+            o = os.read(master_fd, 10240)
+            if o:
+                os.write(sys.stdout.fileno(), o)
+
+    # restore tty settings back
+    termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_tty)
+
+# Start a new container and drop into a bash shell
+def _start(image,name):
+    # Verify args
+    if len(image) == 0:
+        raise ValueError("Image(arg1) cannot be blank")
+
+    # If we didn't populate a name then enumerate on based on image name
+    if name == '':
+        base_name = image.split(":")[0].replace('/','-')
+        existing_containers = [c.name for c in client.containers.list()]
+        i = 1
+        while base_name + str(i) in existing_containers:
+            i += 1
+        name = base_name + str(i)
+
+    else: # Make sure the container name isn't in use
+        try:
+            client.containers.get(name)
+            print('Error: Container "{}" already in use'.format(name))
+            return
+        except docker.errors.NotFound:
+            pass
+
+    # Grab environment variables
+    display = os.environ['DISPLAY']
+    home_dir = os.environ['HOME']
+
+    # Start the container
+    client.containers.run(image,name=name,\
+                            runtime="nvidia",\
+                            environment=["DISPLAY={}".format(display)],\
+                            stdin_open=True,tty=True,\
+                            detach=True,\
+                            auto_remove=True,\
+                            privileged=True,\
+                            publish_all_ports=True,\
+                            working_dir='/home/dev',\
+                            volumes={home_dir: {'bind': '/home/dev', 'mode': 'rw'},\
+                                     '/tmp/.X11-unix':{'bind':'/tmp/.X11-unix', 'mode':'rw'}})
+
+
+    print('Started "{}" [{}]').format(name,image)
+    # Drop into a shell
+    _shell(name)
+
+# List images and running containers
+def _list():
+    images = [img.tags[0] for img in client.images.list() if len(img.tags)>0]
+    print("Containers:")
+    for cont in client.containers.list():
+        if len(cont.image.tags) > 0:
+            print('    "{}" [{}]'.format(cont.name,cont.image.tags[0]))
+        else:
+            print('    "{}" [UNKOWN]'.format(cont.name)) # Probably an image that is being built
+
+    print("Images:")
+    for img in client.images.list():
+        for tag in img.tags:
+            print('    [{}]'.format(tag))
+
+# Kill an existing container
+def _kill(name):
+    # Verify args
+    if len(name) == 0:
+        raise ValueError("Image name (arg1) cannot be blank")
+
+    try:
+        client.containers.get(name).kill()
+        print("killed {}".format(name))
+    except docker.errors.NotFound:
+        print('Container named "{}" does not exist'.format(name))
+
+# Build an image or all images
+def _build(image,extra_args):
+    build_client = docker.APIClient()
+
+    # Extra flags
+    kwargs = {}
+    for arg in extra_args:
+        # Handle extra args here
+        if arg == "--nocache":
+            kwargs["nocache"] = True
+        # More args
+
+
+    # Build all images
+    if image == '':
+        regex = barge_dir + "/../*.dkr"
+        images = glob.glob(regex)
+        for img in images:
+            fname= os.path.basename(os.path.abspath(img))
+            name = os.path.basename(os.path.abspath(os.path.dirname(img)))
+            path = os.path.dirname(os.path.abspath(img))
+            print("Building {}".format(name))
+            out_stream = build_client.build(path=path,tag=name,dockerfile=fname,quiet=False,**kwargs)
+            for line in out_stream:
+                line = json.loads(line).values()[0]
+                try:
+                    line = line.replace("\n","")
+                except:
+                    pass
+                print(line)
+
+    # Build one image
+    else:
+        image_path = barge_dir + "/../" + image + file_ext
+
+        # Verify args
+        if not os.path.isfile(image_path):
+            raise IOError(errno.ENOENT, os.strerror(errno.ENOENT), image_path)
+
+        fname= os.path.basename(image_path)
+        name = image
+        path = os.path.dirname(image_path)
+        print("Building {}".format(name))
+        out_stream = build_client.build(path=path,tag=name,dockerfile=fname,quiet=False,**kwargs)
+        for line in out_stream:
+            line = json.loads(line).values()[0]
+            try:
+                line = line.replace("\n","")
+            except:
+                pass
+            print(line)
+
+def main(args,extra_args):
+    command = args.command
+    arg1 = args.arg1
+    arg2 = args.arg2
+
+    if args.command == "start":
+        _start(arg1,arg2)
+    elif args.command == "shell":
+        _shell(arg1)
+    elif args.command == "kill":
+        _kill(arg1)
+    elif args.command == "list":
+        _list()
+    elif args.command == "build":
+        _build(arg1,extra_args)
+
+# Completer for argcomplete autocomplete
+def completer(prefix, parsed_args, **kwargs):
+    command = parsed_args.command
+    # return images
+    if command == "start":
+        images = []
+        for img in client.images.list():
+            for tag in img.tags:
+                images.append(tag)
+        return images
+    # return running containers
+    elif command == "kill" or command == "shell":
+        return (c.name for c in client.containers.list())
+    # Return potential images to build
+    elif command == "build":
+        return (os.path.basename(dockerfile).replace(file_ext,"") for dockerfile in glob.glob(barge_dir + "/../*" + file_ext))
+    else:
+        return []
+
+# Makes sure we dont recommend files in the current directory when we hit tab
+def nocwd_validator(current_input, keyword_to_check_against):
+    # Only suggest options that aren't files in the current directory and are a potential match
+    not_in_cwd = not current_input.replace("/","") in os.listdir(os.getcwd())
+    partial_match = keyword_to_check_against in current_input.replace("/","")
+    return partial_match and not_in_cwd
+
+if __name__=="__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("command",  choices=['start', 'shell', 'list', 'kill', 'build'])
+    parser.add_argument("arg1",nargs='?',default='').completer = completer
+    parser.add_argument("arg2",nargs='?',default='')
+
+    argcomplete.autocomplete(parser, validator=nocwd_validator)
+    args,extra_args = parser.parse_known_args()
+
+    main(args,extra_args)

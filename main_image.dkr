@@ -1,0 +1,50 @@
+FROM nvidia/cuda:10.0-cudnn7-devel-ubuntu16.04
+ARG DEBIAN_FRONTEND=noninteractive
+
+
+# Update
+RUN apt-get update
+
+# Install sudo
+RUN apt-get -y install sudo
+
+# Create user "dev" with sudo access
+RUN useradd -ms /bin/bash dev
+RUN echo "dev:dev" | chpasswd && adduser dev sudo
+
+# Install python2
+COPY /scripts/xenial/install_python2.sh /tmp/scripts/install_python2.sh
+RUN /tmp/scripts/install_python2.sh
+
+# Install build tools
+COPY /scripts/xenial/install_build_tools.sh /tmp/scripts/install_build_tools.sh
+RUN /tmp/scripts/install_build_tools.sh
+
+# Install dev tools
+COPY /scripts/xenial/install_dev_tools.sh /tmp/scripts/install_dev_tools.sh
+RUN /tmp/scripts/install_dev_tools.sh
+
+# Install opencv
+COPY /scripts/xenial/install_opencv.sh /tmp/scripts/install_opencv.sh
+RUN /tmp/scripts/install_opencv.sh
+
+# Install ROS kinetic
+COPY /scripts/xenial/install_ros_kinetic.sh /tmp/scripts/install_ros_kinetic.sh
+RUN /tmp/scripts/install_ros_kinetic.sh
+
+# Install Tensorflow
+COPY /scripts/xenial/install_tensorflow_gpu.sh /tmp/scripts/install_tensorflow_gpu.sh
+RUN /tmp/scripts/install_tensorflow_gpu.sh
+
+# Install extra packages - these are likely to change often
+# apt-get
+# pip
+
+# Clean up
+RUN rm -rf /var/lib/apt/lists/*
+RUN rm -rf /tmp/*
+
+# Setup environment entry
+USER dev
+WORKDIR /home/dev
+CMD /bin/bash
