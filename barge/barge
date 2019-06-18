@@ -115,9 +115,11 @@ def _start(image,name):
                             detach=True,\
                             auto_remove=True,\
                             privileged=True,\
+                            network="host",\
                             publish_all_ports=True,\
                             working_dir='/home/dev',\
                             volumes={home_dir: {'bind': '/home/dev', 'mode': 'rw'},\
+                                     '/dev/bus/usb':{'bind': '/dev/bus/usb', 'mode': 'rw'},\
                                      '/tmp/.X11-unix':{'bind':'/tmp/.X11-unix', 'mode':'rw'}})
 
 

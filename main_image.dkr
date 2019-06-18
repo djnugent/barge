@@ -37,8 +37,7 @@ COPY /scripts/xenial/install_tensorflow_gpu.sh /tmp/scripts/install_tensorflow_g
 RUN /tmp/scripts/install_tensorflow_gpu.sh
 
 # Install extra packages - these are likely to change often
-# apt-get
-# pip
+RUN apt-get -y install net-tools usbutils
 
 # Clean up
 RUN rm -rf /var/lib/apt/lists/*
